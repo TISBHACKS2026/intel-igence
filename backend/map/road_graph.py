@@ -118,7 +118,7 @@ def enrich_graph_with_elevation(graph_path: str, srtm_path: str, out_dir: str = 
 
 def _cli():
     p = argparse.ArgumentParser()
-    p.add_argument("--srtm", required=True, help="Path to SRTM (GeoTIFF) file for elevation sampling")
+    p.add_argument("--srtm", required=False, default=None, help="Path to SRTM (GeoTIFF) file for elevation sampling (optional). If omitted, uses online Open-Elevation API")
     p.add_argument("--graph", default="backend/map/data/graph.graphml", help="Input graph.graphml path")
     p.add_argument("--out", default="backend/map/data", help="Output data directory")
     args = p.parse_args()
