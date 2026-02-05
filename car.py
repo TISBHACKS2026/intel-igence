@@ -60,7 +60,7 @@ def create_vehicle(id : str, type : str):
     return {
         "id": id,
         "type": type,
-        "profile": profiles,
+        "profile": vehicle_profile,
         "origin": None,
         "destination": None,
         "route": [],
