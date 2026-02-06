@@ -28,7 +28,7 @@ car = Cars(
     road_multipliers = {"highway": 1.8, "primary": 0.9, "secondary": 0.75, "residential": 0.75 },
     impassable_flood_depth_m = 0.3,
     flood_speed_loss_per_mm = 0.2, 
-    flood_penalty_lambda = 70,
+    flood_penalty_lambda = 200,
     color = "#ff7f0e"
 )
 
@@ -38,7 +38,7 @@ bike = Cars(
     road_multipliers = {"highway": 1.5, "primary": 1.0, "secondary": 0.9, "residential": 0.8 },
     impassable_flood_depth_m = 0.1,
     flood_speed_loss_per_mm = 0.5,
-    flood_penalty_lambda = 100,
+    flood_penalty_lambda = 500,
     color = "#2ca02c"
 )   
 
