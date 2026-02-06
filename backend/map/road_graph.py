@@ -109,8 +109,27 @@ def enrich_graph_with_elevation(graph_path: str, srtm_path: str, out_dir: str = 
     # save serialized graph
     pkl_path = os.path.join(out_dir, "graph.pkl")
     json_path = os.path.join(out_dir, "graph.json")
-    nx.write_gpickle(G, pkl_path)
+    # write gpickle: networkx API changed across versions, fall back to pickle if needed
+    try:
+        nx.write_gpickle(G, pkl_path)
+    except AttributeError:
+        import pickle
+        with open(pkl_path, "wb") as fh:
+            pickle.dump(G, fh)
     node_link = json_graph.node_link_data(G)
+    # make geometries JSON-serializable (convert shapely geometries to GeoJSON-like dicts)
+    for link in node_link.get("links", []):
+        geom = link.get("geometry")
+        try:
+            from shapely.geometry.base import BaseGeometry
+        except Exception:
+            BaseGeometry = None
+        if BaseGeometry is not None and isinstance(geom, BaseGeometry):
+            link["geometry"] = {"type": geom.geom_type, "coordinates": list(geom.coords)}
+        else:
+            # if it's a shapely-like object with coords attribute
+            if hasattr(geom, "coords"):
+                link["geometry"] = {"type": getattr(geom, "geom_type", "LineString"), "coordinates": list(geom.coords)}
     with open(json_path, "w", encoding="utf8") as fh:
         json.dump(node_link, fh)
     return G
