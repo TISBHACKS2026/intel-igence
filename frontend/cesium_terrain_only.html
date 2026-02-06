@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Cesium — Terrain Only Demo</title>
+  <link href="https://cdn.jsdelivr.net/npm/cesium@1.138.0/Build/Cesium/Widgets/widgets.css" rel="stylesheet" />
+  <style>html,body,#cesiumContainer{width:100%;height:100%;margin:0;padding:0;overflow:hidden;} #cesiumContainer{position:fixed;inset:0;}</style>
+</head>
+<body>
+  <div id="cesiumControls" style="position:fixed;left:8px;top:8px;z-index:999;background:rgba(255,255,255,0.9);padding:8px;border-radius:6px;font-family:Arial,sans-serif;font-size:13px;">
+    <div style="margin-bottom:6px;">Terrain fallback:</div>
+    <input id="publicTerrainUrl" style="width:420px;margin-bottom:6px;" value="https://assets.agi.com/stk-terrain/v1/tilesets/world/tiles" />
+    <div>
+      <button id="loadPublicTerrain">Load Public Terrain URL</button>
+      <button id="loadIonTerrain">Load Ion World Terrain</button>
+      <button id="resetTerrain">Reset (Ellipsoid)</button>
+    </div>
+    <div id="terrainStatus" style="margin-top:6px;color:#222;font-size:12px;"></div>
+  </div>
+  <div id="cesiumContainer"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/cesium@1.138.0/Build/Cesium/Cesium.js"></script>
+  <script>
+    // Minimal terrain-only Cesium demo.
+    // IMPORTANT: set your Cesium Ion access token below before opening the page.
+    const CESIUM_ION_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiIyZDNiNjU4Yi1mOGM5LTQ3NjEtOWZiYy1lMjhhMzI5ODA3OGEiLCJpZCI6Mzg3ODMxLCJpYXQiOjE3NzAzODU0MDZ9.ESwPwibw8nrZxERbcrLi_H5q_9JMbsamb1_Bo0ig9wI';
+    Cesium.Ion.defaultAccessToken = CESIUM_ION_TOKEN;
+
+    // Choose a location with visible terrain relief (Mount Rainier, WA)
+    const CENTER = { lon: -121.7603, lat: 46.8523, height: 6000 };
+
+    // Initialize viewer using createWorldTerrain() when available, otherwise use IonResource.
+    (function initTerrainViewerSimple() {
+      let terrainProvider;
+      try {
+        if (typeof Cesium.createWorldTerrain === 'function') {
+          terrainProvider = Cesium.createWorldTerrain();
+          console.info('Using Cesium.createWorldTerrain()');
+        } else if (Cesium.IonResource && Cesium.IonResource.fromAssetId) {
+          try {
+            const ionRes = Cesium.IonResource.fromAssetId(1);
+            terrainProvider = new Cesium.CesiumTerrainProvider({ url: ionRes });
+            console.info('Created CesiumTerrainProvider from IonResource');
+          } catch (e) {
+            console.warn('IonResource -> CesiumTerrainProvider failed; using ellipsoid', e);
+            terrainProvider = new Cesium.EllipsoidTerrainProvider();
+          }
+        } else {
+          terrainProvider = new Cesium.EllipsoidTerrainProvider();
+        }
+
+        const viewer = new Cesium.Viewer('cesiumContainer', {
+          terrainProvider: terrainProvider,
+          animation: false,
+          timeline: false,
+          baseLayerPicker: false,
+          geocoder: false,
+          homeButton: true,
+          sceneModePicker: true,
+          navigationHelpButton: false,
+          infoBox: false,
+          selectionIndicator: false
+        });
+        // expose viewer globally so UI buttons can change terrain provider at runtime
+        window.viewer = viewer;
+
+        try { viewer.imageryLayers.removeAll(); } catch (e) {}
+        // Ensure there's a visible base imagery layer (OpenStreetMap) so the globe isn't a plain blue ellipsoid
+        try {
+          const osm = viewer.imageryLayers.addImageryProvider(new Cesium.OpenStreetMapImageryProvider({ url: 'https://a.tile.openstreetmap.org/' }));
+          osm.alpha = 1.0; osm.show = true; viewer.imageryLayers.raiseToTop(osm);
+          console.info('Added OpenStreetMap base layer for visibility', osm);
+        } catch (e) { console.warn('Failed to add OSM imagery', e); }
+        viewer.scene.globe.show = true;
+        viewer.scene.globe.enableLighting = true;
+        try { viewer.scene.globe.baseColor = new Cesium.Color(0.75,0.75,0.78,1.0); } catch (e) {}
+
+        viewer.camera.setView({ destination: Cesium.Cartesian3.fromDegrees(CENTER.lon, CENTER.lat, CENTER.height), orientation: { heading: Cesium.Math.toRadians(0.0), pitch: Cesium.Math.toRadians(-45.0), roll: 0.0 } });
+
+        // Show provider debug info in control panel
+        try {
+          const status = document.getElementById('terrainStatus');
+          const ctor = terrainProvider && terrainProvider.constructor && terrainProvider.constructor.name;
+          status.textContent = 'Provider: ' + (ctor || 'unknown') + '  readyPromise: ' + (!!(terrainProvider && terrainProvider.readyPromise));
+          console.log('terrainProvider prototype keys:', Object.getOwnPropertyNames(Object.getPrototypeOf(terrainProvider || {})));
+          if (terrainProvider && terrainProvider.readyPromise) {
+            terrainProvider.readyPromise.then(() => { console.info('World Terrain provider ready'); status.textContent += ' — ready'; }).catch(err => { console.warn('World Terrain provider readyPromise rejected', err); status.textContent += ' — readyPromise rejected'; });
+          } else {
+            console.info('Terrain provider has no readyPromise; check console for tile load events');
+          }
+        } catch (e) { console.warn('Failed to display terrain provider status', e); }
+
+        // Attach globe tile load progress listener
+        try {
+          if (viewer.scene && viewer.scene.globe && viewer.scene.globe.tileLoadProgressEvent) {
+            viewer.scene.globe.tileLoadProgressEvent.addEventListener(function(progress) { console.info('globe.tileLoadProgressEvent:', progress); });
+          }
+        } catch (e) { console.warn('failed to attach tileLoadProgressEvent listener', e); }
+
+        console.log('Cesium terrain-only demo initialized. Center:', CENTER);
+      } catch (e) {
+        console.error('Failed to initialize terrain viewer', e);
+      }
+    })();
+
+    // UI helpers to load a public terrain tileset URL at runtime
+    (function setupTerrainControls() {
+      const status = document.getElementById('terrainStatus');
+      const btn = document.getElementById('loadPublicTerrain');
+      const ionBtn = document.getElementById('loadIonTerrain');
+      const resetBtn = document.getElementById('resetTerrain');
+      const input = document.getElementById('publicTerrainUrl');
+      function setStatus(msg, isError) { status.textContent = msg; status.style.color = isError ? 'crimson' : '#222'; }
+
+      btn.addEventListener('click', function() {
+        const url = input.value.trim();
+        if (!url) { setStatus('Enter a tileset root or tileset.json URL', true); return; }
+        setStatus('Creating CesiumTerrainProvider for: ' + url);
+        try {
+          const provider = new Cesium.CesiumTerrainProvider({ url: url });
+          // assign provider to viewer
+          if (window.viewer) {
+            window.viewer.terrainProvider = provider;
+            setStatus('Assigned provider; waiting for readyPromise...');
+            if (provider.readyPromise) {
+              provider.readyPromise.then(() => setStatus('Public terrain provider ready')).catch(err => { console.warn(err); setStatus('Public terrain provider failed: ' + err, true); });
+            } else {
+              setStatus('Provider has no readyPromise; watch console for tile errors');
+            }
+          } else {
+            setStatus('Viewer not found on window.viewer', true);
+          }
+        } catch (e) {
+          console.error('Failed to create CesiumTerrainProvider', e);
+          setStatus('Failed to create provider: ' + e, true);
+        }
+      });
+
+      resetBtn.addEventListener('click', function() {
+        if (!window.viewer) return setStatus('Viewer not available', true);
+        window.viewer.terrainProvider = new Cesium.EllipsoidTerrainProvider();
+        setStatus('Reset to EllipsoidTerrainProvider');
+      });
+
+      // Handler to explicitly load Cesium World Terrain via Ion (assetId: 1)
+      ionBtn.addEventListener('click', function() {
+        if (!Cesium.IonResource || !Cesium.IonResource.fromAssetId) return setStatus('Cesium.IonResource unavailable in this build', true);
+        setStatus('Creating IonResource for assetId 1...');
+        try {
+          const ionRes = Cesium.IonResource.fromAssetId(1);
+          const provider = new Cesium.CesiumTerrainProvider({ url: ionRes });
+          if (window.viewer) {
+            window.viewer.terrainProvider = provider;
+            setStatus('Assigned Ion terrain provider; waiting for readyPromise...');
+            if (provider.readyPromise) provider.readyPromise.then(() => setStatus('Ion World Terrain ready')).catch(err => { console.warn(err); setStatus('Ion provider failed: ' + err, true); });
+          } else {
+            setStatus('Viewer not found; cannot assign Ion provider', true);
+          }
+        } catch (e) {
+          console.error('Ion provider creation failed', e);
+          setStatus('Ion provider creation failed: ' + e, true);
+        }
+      });
+
+      // Auto-attempt Ion World Terrain once (user approved)
+      setTimeout(function() {
+        try {
+          ionBtn.click();
+        } catch (e) { /* ignore */ }
+      }, 800);
+    })();
+  </script>
+</body>
+</html>

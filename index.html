@@ -22,6 +22,7 @@
       <a onclick="showSection('routing')">Routing Engine</a>
       <a onclick="showSection('risk')">Risk Assessment</a>
       <a onclick="showSection('simulation')">Simulation</a>
+      <a onclick="showSection('demo')">Live Demo</a>
     </nav>
 
     <div class="content">
@@ -558,6 +559,26 @@ avg_cost = sum(r[<span class="string">"total_cost"</span>] <span class="keyword"
 ]
         </div>
       </section>
+
+      <!-- Demo Section -->
+      <section id="demo">
+        <h2>Live Cesium Demo</h2>
+        <p>Interactive Cesium viewer (terrain, rain, and roads). If the iframe is blank when opened directly from the filesystem, open the demo via the local server at <code>http://127.0.0.1:5100/</code>.</p>
+        <div style="margin:8px 0 16px 0">
+          <button onclick="openFullViewer()">Open Full Viewer</button>
+          <button onclick="openRoadRiskSource()" style="margin-left:8px">View roadrisk.py</button>
+        </div>
+        <div style="margin-bottom:8px; font-size:13px; color:#666;">
+          If this page was opened from the filesystem and the demo fails to load, open the demo on the local server instead:
+          <a href="http://127.0.0.1:5100/frontend/cesium_viewer.html">127.0.0.1:5100</a>
+          or <a href="http://localhost:5100/frontend/cesium_viewer.html">localhost:5100</a>
+          (or replace with your machine LAN IP, e.g. <code>http://192.168.1.13:5100/</code>).
+        </div>
+        <div style="width:100%; height:640px; border:1px solid #ddd; background:#000;">
+          <iframe id="cesiumDemoFrame" src="" style="width:100%; height:100%; border:0;" title="Cesium Demo"></iframe>
+        </div>
+      </section>
+
     </div>
 
     <footer>
@@ -578,6 +599,37 @@ avg_cost = sum(r[<span class="string">"total_cost"</span>] <span class="keyword"
       // Scroll to top
       window.scrollTo(0, 0);
     }
+
+    function openFullViewer() {
+      if (location.protocol === 'file:') {
+        // opened from filesystem; use relative path
+        window.location.href = 'frontend/cesium_viewer.html';
+      } else {
+        // served by backend server
+        window.location.href = '/frontend/cesium_viewer.html';
+      }
+    }
+
+    function openRoadRiskSource() {
+      if (location.protocol === 'file:') {
+        // open the local source file directly
+        window.open('roadrisk.py', '_blank');
+      } else {
+        window.open('/api/roadrisk_source', '_blank');
+      }
+    }
+
+    // Set iframe src appropriately after DOM ready so file:// vs http:// works
+    document.addEventListener('DOMContentLoaded', function() {
+      const frame = document.getElementById('cesiumDemoFrame');
+      if (!frame) return;
+      if (location.protocol === 'file:') {
+        // prefer the local server when opened from filesystem
+        frame.src = 'http://127.0.0.1:5100/frontend/cesium_viewer.html';
+      } else {
+        frame.src = '/frontend/cesium_viewer.html';
+      }
+    });
   </script>
 </body>
 </html>

@@ -1,0 +1,834 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Cesium — Indiranagar (Terrain + OSM buildings + Rain + Roads)</title>
+  <link href="https://cdn.jsdelivr.net/npm/cesium@1.138.0/Build/Cesium/Widgets/widgets.css" rel="stylesheet" />
+  <style>
+    html,body,#cesiumContainer { width:100%; height:100%; margin:0; padding:0; overflow:hidden; }
+    #info { position: absolute; left: 8px; top: 8px; background: rgba(255,255,255,0.9); padding:8px; border-radius:4px; font-family: sans-serif; z-index: 2; }
+  </style>
+</head>
+<body>
+  <div id="cesiumContainer"></div>
+  <div id="info">Initializing...</div>
+  <!-- terrainControls removed: auto-reset to Ellipsoid now enabled -->
+  <div id="floodControls" style="position:fixed;right:8px;top:8px;z-index:999;background:rgba(255,255,255,0.9);padding:8px;border-radius:4px;font-family: sans-serif;">
+    <div style="font-weight:600;margin-bottom:6px">Flood sim (Indiranagar)</div>
+    <div style="margin-bottom:6px">Center: lon <input id="centerLon" value="77.6406" style="width:90px"/> lat <input id="centerLat" value="12.9719" style="width:90px"/> <button id="setCenter">Set Center</button></div>
+    <div style="margin-bottom:6px">Cell size (m): <input id="cellSize" value="20" style="width:60px"/></div>
+    <div style="margin-bottom:6px">Extent (m): <input id="extentSize" value="400" style="width:80px"/> (square)</div>
+    <div style="margin-bottom:6px"><button id="buildGrid">Build Grid & Sample Elevation</button> <button id="fetchRegionRoads">Fetch Roads In Region</button></div>
+    <div style="margin-bottom:6px"><button id="startFlood">Start Flood</button> <button id="resetFlood">Reset</button></div>
+    <div style="margin-bottom:6px">Water level (m): <input id="waterSlider" type="range" min="0" max="10" step="0.1" value="0" style="width:160px;vertical-align:middle;" disabled/> <span id="waterValue">0.0</span></div>
+    <div id="floodStatus" style="font-size:12px;color:#222;margin-top:6px">idle</div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/cesium@1.138.0/Build/Cesium/Cesium.js"></script>
+  <script>
+    // === CONFIG ===
+    // 1) Replace with your Cesium Ion Access Token
+    const CESIUM_ION_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiIyZDNiNjU4Yi1mOGM5LTQ3NjEtOWZiYy1lMjhhMzI5ODA3OGEiLCJpZCI6Mzg3ODMxLCJpYXQiOjE3NzAzODU0MDZ9.ESwPwibw8nrZxERbcrLi_H5q_9JMbsamb1_Bo0ig9wI';
+    // 2) Backend endpoint returning GeoJSON of roads with `properties.flood_risk` (0..1)
+    // Default to the current page origin when served over HTTP so the request
+    // is same-origin (avoids CORS). If the page isn't served over HTTP, fall
+    // back to the local backend we started at port 5001.
+    let ROADS_API_URL;
+    if (location && location.protocol && location.protocol.startsWith('http')) {
+      ROADS_API_URL = window.location.origin + '/api/roads_flood_risk';
+    } else {
+      ROADS_API_URL = 'http://localhost:5001/api/roads_flood_risk';
+    }
+
+    // Basic token sanity check — don't rely on exact placeholder string comparisons.
+    if (!CESIUM_ION_TOKEN || typeof CESIUM_ION_TOKEN !== 'string' || CESIUM_ION_TOKEN.length < 20) {
+      console.warn('Replace CESIUM_ION_TOKEN with a valid Cesium Ion access token. Using placeholder may fail to load World Terrain.');
+    } else {
+      console.info('CESIUM_ION_TOKEN appears set (length ' + CESIUM_ION_TOKEN.length + ').');
+    }
+
+    Cesium.Ion.defaultAccessToken = CESIUM_ION_TOKEN;
+
+    // update info box to reflect token + backend URL state
+    (function updateInfoBox() {
+      const info = document.getElementById('info');
+      const tokenLooksSet = CESIUM_ION_TOKEN && !CESIUM_ION_TOKEN.startsWith('YOUR_') && CESIUM_ION_TOKEN.length > 20;
+      const backend = ROADS_API_URL;
+      if (tokenLooksSet) {
+        info.innerHTML = 'Cesium token set. Terrain exaggeration 1.5x. Road feed: <b>' + backend + '</b>';
+        info.innerHTML += '<br><button id="loadIonBtn">Load Ion 3D Tiles (asset id)</button> <button id="loadUrlBtn">Load 3D-Tiles URL</button>';
+      } else {
+        info.innerHTML = 'Missing Cesium token — set <b>CESIUM_ION_TOKEN</b> in the file. Road feed: <b>' + backend + '</b>';
+      }
+    })();
+
+    // Wire buttons for loading 3D tiles at runtime
+    function loadIonTileset(assetId) {
+      const info = document.getElementById('info');
+      try {
+        const resource = Cesium.IonResource.fromAssetId(Number(assetId));
+        const tileset = new Cesium.Cesium3DTileset({ url: resource });
+        tileset.readyPromise.then(() => {
+          viewer.scene.primitives.add(tileset);
+          console.info('Loaded Ion tileset asset', assetId);
+          info.innerHTML += '<br>Loaded Ion tileset: ' + assetId;
+        }).catch(err => {
+          console.warn('Ion tileset readyPromise rejected', err);
+          info.innerHTML += '<br style="color:red">Failed to load Ion tileset: ' + err;
+        });
+      } catch (e) {
+        console.warn('Failed to load Ion tileset', e);
+        info.innerHTML += '<br style="color:red">Failed to load Ion tileset: ' + e;
+      }
+    }
+
+    function loadTilesetUrl(url) {
+      const info = document.getElementById('info');
+      try {
+        const tileset = new Cesium.Cesium3DTileset({ url: url });
+        tileset.readyPromise.then(() => {
+          viewer.scene.primitives.add(tileset);
+          console.info('Loaded tileset URL', url);
+          info.innerHTML += '<br>Loaded tileset URL: ' + url;
+        }).catch(err => {
+          console.warn('Tileset URL failed to load', err);
+          info.innerHTML += '<br style="color:red">Failed to load tileset URL: ' + err;
+        });
+      } catch (e) {
+        console.warn('Failed to construct tileset', e);
+        info.innerHTML += '<br style="color:red">Failed to construct tileset: ' + e;
+      }
+    }
+
+    document.addEventListener('click', function (e) {
+      if (e.target && e.target.id === 'loadIonBtn') {
+        const id = prompt('Enter Cesium Ion asset ID (numeric) to load 3D-tiles:');
+        if (id) loadIonTileset(id.trim());
+      }
+      if (e.target && e.target.id === 'loadUrlBtn') {
+        const url = prompt('Enter 3D-tiles tileset.json URL:');
+        if (url) loadTilesetUrl(url.trim());
+      }
+    });
+
+    // Coordinates for Indiranagar, Bengaluru (approx)
+    let CENTER = { lon: 77.6406, lat: 12.9719, height: 2500 };
+
+    // Create World Terrain and viewer (with safe fallback if helper missing)
+    let terrainProvider;
+    if (typeof Cesium.createWorldTerrain === 'function') {
+      terrainProvider = Cesium.createWorldTerrain({ requestVertexNormals: false });
+    } else {
+      try {
+        // Fallback: construct a CesiumTerrainProvider using Ion resource id 1 (World Terrain)
+        const ionResource = Cesium.IonResource.fromAssetId(1);
+        terrainProvider = new Cesium.CesiumTerrainProvider({ url: ionResource });
+        console.info('Using CesiumTerrainProvider fallback for World Terrain.');
+      } catch (e) {
+        console.warn('World Terrain helper unavailable and fallback failed — using ellipsoid terrain.', e);
+        terrainProvider = new Cesium.EllipsoidTerrainProvider();
+      }
+    }
+
+    const viewer = new Cesium.Viewer('cesiumContainer', {
+      terrainProvider: terrainProvider,
+      timeline: false,
+      animation: false,
+      baseLayerPicker: true,
+      sceneModePicker: true,
+      geocoder: false,
+      homeButton: true,
+      infoBox: false,
+      selectionIndicator: false
+    });
+    // expose viewer for console and runtime controls
+    window.viewer = viewer;
+
+    // Auto-reset terrain to Ellipsoid so the demo starts in the known working state
+    try {
+      viewer.terrainProvider = new Cesium.EllipsoidTerrainProvider();
+      const infoEl = document.getElementById('info');
+      if (infoEl) infoEl.innerHTML += '<br>Terrain: Ellipsoid (auto)';
+    } catch (e) { console.warn('Failed to auto-reset terrain to Ellipsoid', e); }
+
+    // Ensure there's a visible base imagery layer even if Ion imagery is unavailable
+    try {
+      // Remove any pre-existing imagery layers (some builds include a default layer that may not be reachable),
+      // then add OpenStreetMap as the single base layer to ensure tiles appear.
+      try { viewer.imageryLayers.removeAll(); } catch (e) { console.warn('Failed to remove existing imagery layers', e); }
+
+      // Add OpenStreetMap as a reliable fallback base layer
+      const osmLayer = viewer.imageryLayers.addImageryProvider(new Cesium.OpenStreetMapImageryProvider({ url: 'https://a.tile.openstreetmap.org/' }));
+      // Ensure the OSM layer is visible and fully opaque
+      osmLayer.alpha = 1.0;
+      osmLayer.show = true;
+      viewer.imageryLayers.raiseToTop(osmLayer);
+      console.info('Added OpenStreetMap imagery fallback', osmLayer);
+      try { console.info('OSM provider ready (ready flag):', !!(osmLayer.imageryProvider && osmLayer.imageryProvider.ready)); } catch (e) {}
+
+      // If provider exposes a readyPromise, log when it resolves or rejects
+      try {
+        const prov = osmLayer.imageryProvider;
+        if (prov && prov.readyPromise) {
+          prov.readyPromise.then(() => console.info('OSM provider.readyPromise resolved (provider ready)')).catch(err => console.warn('OSM provider.readyPromise rejected', err));
+        }
+      } catch (e) { console.warn('Error inspecting osm provider readyPromise', e); }
+
+      // Diagnostic: try loading a sample OSM tile as an Image to detect network/CORS/load issues
+      try {
+        const testTile = new Image();
+        testTile.crossOrigin = 'anonymous';
+        testTile.onload = () => console.info('Test OSM tile loaded OK (image onload)');
+        testTile.onerror = (ev) => console.warn('Test OSM tile failed to load (image onerror)', ev);
+        // Example tile near our center at zoom 10 — may vary by viewport
+        testTile.src = 'https://a.tile.openstreetmap.org/10/548/382.png';
+      } catch (e) { console.warn('Failed to create test image for OSM tile', e); }
+    } catch (e) {
+      console.warn('Failed to add OpenStreetMap imagery fallback', e);
+    }
+
+    // Debug: list imagery layers/providers present
+    try {
+      console.group('Imagery layers');
+      for (let i = 0; i < viewer.imageryLayers.length; i++) {
+        const lyr = viewer.imageryLayers.get(i);
+        const prov = lyr && lyr.imageryProvider;
+        console.log('layer', i, { providerConstructor: prov && prov.constructor && prov.constructor.name, provider: prov, ready: prov && prov.ready });
+      }
+      console.groupEnd();
+    } catch (e) {
+      console.warn('Imagery layer inspection failed', e);
+    }
+
+    // Slight terrain exaggeration (1.5x)
+    // Some Cesium builds don't support terrainExaggeration; guard the assignment.
+    if (viewer.scene && viewer.scene.globe && 'terrainExaggeration' in viewer.scene.globe) {
+      try { viewer.scene.globe.terrainExaggeration = 1.5; } catch (e) { console.warn('Failed to set terrainExaggeration', e); }
+    } else {
+      console.info('terrainExaggeration not supported by this Cesium build; skipping.');
+    }
+
+    // Center camera at Indiranagar
+    viewer.camera.setView({
+      destination: Cesium.Cartesian3.fromDegrees(CENTER.lon, CENTER.lat, CENTER.height),
+      orientation: {
+        heading: Cesium.Math.toRadians(0.0),
+        pitch: Cesium.Math.toRadians(-45.0),
+        roll: 0.0
+      }
+    });
+
+    // Ensure globe is shown and nudge camera lower for better visibility
+    try { viewer.scene.globe.show = true; } catch (e) {}
+    try { viewer.camera.flyTo({ destination: Cesium.Cartesian3.fromDegrees(CENTER.lon, CENTER.lat, 800), duration: 1.2 }); } catch (e) {}
+
+    // Add OSM 3D buildings (Cesium helper)
+    try {
+      const osm = Cesium.createOsmBuildings();
+      viewer.scene.primitives.add(osm);
+    } catch (e) {
+      console.warn('createOsmBuildings() not available in this build; skip OSM 3D buildings.', e);
+    }
+
+    // Ensure there is at least one visible base imagery (so Reset shows a textured globe)
+    try {
+      if (!viewer.imageryLayers || viewer.imageryLayers.length === 0) {
+        viewer.imageryLayers.addImageryProvider(new Cesium.OpenStreetMapImageryProvider({ url: 'https://a.tile.openstreetmap.org/' }));
+      }
+    } catch (e) { console.warn('Failed to ensure OSM imagery in main viewer', e); }
+
+    // --- Animated rain using ParticleSystem ---
+    // Create a small circular raindrop image via canvas
+    function makeDropImage() {
+      const c = document.createElement('canvas');
+      c.width = 8; c.height = 20; const ctx = c.getContext('2d');
+      // blue vertical drop
+      ctx.fillStyle = 'rgba(180,200,255,0.9)';
+      ctx.beginPath(); ctx.ellipse(4,8,2,6,0,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle = 'rgba(200,220,255,0.4)'; ctx.fillRect(3,0,2,8);
+      return c.toDataURL();
+    }
+
+    const dropImage = makeDropImage();
+
+    // We'll add a particle system that spans a box above the center and emits particles that fall down.
+    function addRain() {
+      const centerCartesian = Cesium.Cartesian3.fromDegrees(CENTER.lon, CENTER.lat, 2000);
+      const modelMatrix = Cesium.Transforms.eastNorthUpToFixedFrame(centerCartesian);
+
+      const boxSize = new Cesium.Cartesian3(20000.0, 20000.0, 1.0); // 20km x 20km area
+
+      const rain = new Cesium.ParticleSystem({
+        image: dropImage,
+        startColor: new Cesium.Color(0.7,0.8,1.0,0.9),
+        endColor: new Cesium.Color(0.7,0.8,1.0,0.0),
+        startScale: 1.0,
+        endScale: 1.0,
+        minimumSpeed: 1500.0,
+        maximumSpeed: 3500.0,
+        minimumLife: 3.0,
+        maximumLife: 6.0,
+        imageSize: new Cesium.Cartesian2(8,20),
+        emissionRate: 1500.0,
+        emitter: new Cesium.BoxEmitter(boxSize),
+        modelMatrix: modelMatrix
+      });
+
+      // Override particle update so particles fall straight down (world Z)
+      rain.updateCallback = function(particle, dt) {
+        // If velocity not yet set to downward, set it once
+        if (!particle._downwardInit) {
+          particle._downwardInit = true;
+          // set downward velocity in local model space: negative Z
+          const speed = Cesium.Math.lerp(rain.minimumSpeed, rain.maximumSpeed, Math.random());
+          particle.velocity = new Cesium.Cartesian3(0.0, 0.0, -speed);
+        }
+        // integrate position using particle.velocity
+        const delta = Cesium.Cartesian3.multiplyByScalar(particle.velocity, dt, new Cesium.Cartesian3());
+        particle.position = Cesium.Cartesian3.add(particle.position, delta, new Cesium.Cartesian3());
+      };
+
+      viewer.scene.primitives.add(rain);
+    }
+
+    addRain();
+
+    // --- Overlay roads as polylines and color based on flood risk ---
+    // Map flood risk (0..1) to a smoother gradient: green -> orange -> red
+    function riskToColor(r) {
+      r = Math.max(0, Math.min(1, r));
+      // define RGB endpoints
+      const greenColor = { r: 0.0, g: 0.8, b: 0.2 };
+      const orangeColor = { r: 1.0, g: 0.6, b: 0.0 };
+      const redColor = { r: 1.0, g: 0.0, b: 0.0 };
+
+      let rr, gg, bb;
+      if (r <= 0.5) {
+        // interpolate green -> orange for r in [0,0.5]
+        const t = r / 0.5;
+        rr = greenColor.r + (orangeColor.r - greenColor.r) * t;
+        gg = greenColor.g + (orangeColor.g - greenColor.g) * t;
+        bb = greenColor.b + (orangeColor.b - greenColor.b) * t;
+      } else {
+        // interpolate orange -> red for r in (0.5,1]
+        const t = (r - 0.5) / 0.5;
+        rr = orangeColor.r + (redColor.r - orangeColor.r) * t;
+        gg = orangeColor.g + (redColor.g - orangeColor.g) * t;
+        bb = orangeColor.b + (redColor.b - orangeColor.b) * t;
+      }
+      return new Cesium.Color(rr, gg, bb, 0.9);
+    }
+
+    // Maintain a map of feature id -> entity
+    const roadEntities = new Map();
+
+    async function fetchAndUpdateRoads() {
+      try {
+        // Compute bbox around CENTER using the current extentSize (meters)
+        const extentMeters = Number(document.getElementById('extentSize') ? document.getElementById('extentSize').value : 400) || 400;
+        const halfMeters = extentMeters / 2.0;
+        const degHalf = halfMeters / 111320.0;
+        const south = CENTER.lat - degHalf;
+        const north = CENTER.lat + degHalf;
+        const west = CENTER.lon - degHalf;
+        const east = CENTER.lon + degHalf;
+
+        // Fetch geometry from roads_bbox for the computed bbox
+        const geomRes = await fetch('/api/roads_bbox', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bbox: [west, south, east, north] }) });
+        if (!geomRes.ok) throw new Error('roads_bbox HTTP ' + geomRes.status);
+        const geomJson = await geomRes.json();
+
+        // Fetch risk mappings filtered to this bbox (backend returns dict when bbox provided)
+        const bboxStr = [west, south, east, north].join(',');
+        const riskRes = await fetch('/api/roads_risk?bbox=' + encodeURIComponent(bboxStr), { cache: 'no-store' });
+        let riskMap = new Map();
+        if (riskRes.ok) {
+          const rj = await riskRes.json();
+          if (rj && rj.roads) {
+            // support both array (legacy) and object/dict (new)
+            if (Array.isArray(rj.roads)) {
+              for (const r of rj.roads) {
+                if (r && r.id != null) {
+                  riskMap.set(String(r.id), { risk: Number(r.risk) || 0.0, avg_elevation: (r.avg_elevation != null ? Number(r.avg_elevation) : null) });
+                }
+              }
+            } else {
+              for (const key in rj.roads) {
+                const r = rj.roads[key];
+                const rid = (r && r.id != null) ? String(r.id) : String(key);
+                if (rid) {
+                  riskMap.set(rid, { risk: Number(r && r.risk) || 0.0, avg_elevation: (r && r.avg_elevation != null ? Number(r.avg_elevation) : null) });
+                }
+              }
+            }
+          }
+        }
+
+        const geojson = geomJson;
+        if (!geojson || !geojson.features) return;
+
+        // Add or update features, applying risk from riskMap when available
+        for (const feat of geojson.features) {
+          if (!feat.geometry || feat.geometry.type !== 'LineString') continue;
+          const coords = feat.geometry.coordinates;
+          const positions = [];
+          for (const c of coords) {
+            const h = (c[2] || 0) + 8.0;
+            positions.push(Cesium.Cartesian3.fromDegrees(c[0], c[1], h));
+          }
+
+          const id = String(feat.id || (feat.properties && feat.properties.id) || JSON.stringify(coords).slice(0,40));
+          const riskEntry = (riskMap.has(id)) ? riskMap.get(id) : null;
+          const risk = riskEntry ? riskEntry.risk : (feat.properties && typeof feat.properties.flood_risk === 'number' ? feat.properties.flood_risk : 0.0);
+          const avg_elevation = riskEntry ? (riskEntry.avg_elevation != null ? riskEntry.avg_elevation : null) : (feat.properties && feat.properties.avg_elevation ? Number(feat.properties.avg_elevation) : null);
+          const color = riskToColor(risk);
+
+          if (roadEntities.has(id)) {
+            const ent = roadEntities.get(id);
+            ent.polyline.material = new Cesium.ColorMaterialProperty(color);
+            ent.polyline.positions = positions;
+            ent.properties && (ent.properties.flood_risk = risk);
+            // keep original coords and avg_elevation for flood testing
+            try { ent.properties.origCoords = coords; ent.properties.avg_elevation = avg_elevation; } catch (e) {}
+          } else {
+            const ent = viewer.entities.add({
+              id: id,
+              polyline: {
+                positions: positions,
+                width: 6.0,
+                material: new Cesium.PolylineGlowMaterialProperty({ color: color.withAlpha(0.95) }),
+                clampToGround: false,
+                depthFailMaterial: new Cesium.PolylineGlowMaterialProperty({ color: color.withAlpha(0.6) })
+              },
+              label: {
+                text: id,
+                font: '14px sans-serif',
+                fillColor: Cesium.Color.WHITE,
+                style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+                outlineColor: Cesium.Color.BLACK,
+                outlineWidth: 2,
+                pixelOffset: new Cesium.Cartesian2(0, -12),
+                disableDepthTestDistance: Number.POSITIVE_INFINITY
+              },
+              properties: {
+                flood_risk: risk,
+                origCoords: coords,
+                avg_elevation: avg_elevation
+              }
+            });
+            roadEntities.set(id, ent);
+          }
+        }
+
+        try {
+          const info = document.getElementById('info');
+          info.innerHTML = 'Loaded ' + geojson.features.length + ' road features (bbox). Road feed: <b>/api/roads_bbox + /api/roads_risk</b>';
+        } catch (e) {}
+
+        console.info('Updated roads — entities:', roadEntities.size, 'viewer.entities:', viewer.entities.values.length);
+      } catch (err) {
+        console.warn('Failed to fetch roads:', err);
+        try { document.getElementById('info').innerHTML = 'Failed to load roads: ' + (err && err.message || err); } catch(e){}
+      }
+    }
+
+    // Fetch roads specifically for a bbox (used after grid built) and replace displayed roads
+    async function fetchRoadsForBoxAndSave(west, south, east, north) {
+      try {
+        const geomRes = await fetch('/api/roads_bbox', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bbox: [west, south, east, north] }) });
+        if (!geomRes.ok) throw new Error('roads_bbox HTTP ' + geomRes.status);
+        const geomJson = await geomRes.json();
+
+        const bboxStr = [west, south, east, north].join(',');
+        const riskRes = await fetch('/api/roads_risk?bbox=' + encodeURIComponent(bboxStr), { cache: 'no-store' });
+        let riskMap = new Map();
+        let riskArray = [];
+        if (riskRes.ok) {
+          const rj = await riskRes.json();
+          if (rj && rj.roads) {
+            if (Array.isArray(rj.roads)) {
+              riskArray = rj.roads;
+              for (const r of rj.roads) {
+                if (r && r.id != null) riskMap.set(String(r.id), { risk: Number(r.risk) || 0.0, avg_elevation: (r.avg_elevation != null ? Number(r.avg_elevation) : null) });
+              }
+            } else {
+              // dict form
+              for (const key in rj.roads) {
+                const r = rj.roads[key];
+                const rid = (r && r.id != null) ? String(r.id) : String(key);
+                if (rid) {
+                  riskMap.set(rid, { risk: Number(r && r.risk) || 0.0, avg_elevation: (r && r.avg_elevation != null ? Number(r.avg_elevation) : null) });
+                  riskArray.push(r);
+                }
+              }
+            }
+          }
+        }
+
+        // Remove all existing road entities and re-add only those inside bbox
+        for (const ent of roadEntities.values()) { try { viewer.entities.remove(ent); } catch(e){} }
+        roadEntities.clear();
+
+        for (const feat of geomJson.features || []) {
+          if (!feat.geometry || feat.geometry.type !== 'LineString') continue;
+          const coords = feat.geometry.coordinates;
+          const positions = [];
+          for (const c of coords) positions.push(Cesium.Cartesian3.fromDegrees(c[0], c[1], (c[2] || 0) + 8.0));
+          const id = String(feat.id || (feat.properties && feat.properties.id) || JSON.stringify(coords).slice(0,40));
+          if (!riskMap.has(id)) continue; // skip ways that don't have risk record for this bbox
+          const re = riskMap.get(id);
+          const color = riskToColor(re.risk || 0.0);
+          const ent = viewer.entities.add({ id: id, polyline: { positions, width: 6.0, material: new Cesium.PolylineGlowMaterialProperty({ color: color.withAlpha(0.95) }) }, properties: { flood_risk: re.risk, origCoords: coords, avg_elevation: re.avg_elevation } });
+          roadEntities.set(id, ent);
+        }
+
+        // Persist filtered risk array to backend so backend/roads_with_risk.json contains only this area
+        try {
+          await fetch('/api/save_roads_risk', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ roads: riskArray }) });
+        } catch (e) { console.warn('failed to save roads risk to backend', e); }
+
+        document.getElementById('info').innerHTML = 'Loaded ' + roadEntities.size + ' roads for grid bbox and saved to backend/roads_with_risk.json';
+      } catch (e) {
+        console.error('fetchRoadsForBoxAndSave failed', e);
+        document.getElementById('floodStatus').textContent = 'Failed to fetch roads for grid: ' + (e && e.message);
+      }
+    }
+
+    // Initial fetch and periodic updates
+    fetchAndUpdateRoads();
+    setInterval(fetchAndUpdateRoads, 5000); // poll every 5s
+
+    // Simple helper to show sampling on click
+    viewer.screenSpaceEventHandler.setInputAction(function(click) {
+      const picked = viewer.scene.pick(click.position);
+      if (Cesium.defined(picked) && Cesium.defined(picked.id) && picked.id.properties) {
+        const p = picked.id.properties;
+        alert('Road ID: ' + picked.id.id + '\nFlood risk: ' + (p.flood_risk || 0));
+      }
+    }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+    // Helpful console message
+    console.log('Cesium viewer initialized. Center:', CENTER);
+
+    // Flood simulation state
+    const floodState = { cells: [], waterLevel: null, animId: null, playing: false };
+
+    function metersToDegrees(lat, meters) {
+      const latDeg = meters / 111320.0;
+      const lonDeg = meters / (111320.0 * Math.cos(Cesium.Math.toRadians(lat)));
+      return { latDeg, lonDeg };
+    }
+
+    // Build grid over CENTER with given cell size and extent (meters)
+    async function buildGridAndSample(cellSizeM, extentM) {
+      const status = document.getElementById('floodStatus');
+      status.textContent = 'building grid...';
+      // compute grid dims
+      const half = extentM / 2.0;
+      const degsHalf = metersToDegrees(CENTER.lat, half);
+      const lat0 = CENTER.lat - degsHalf.latDeg;
+      const lon0 = CENTER.lon - degsHalf.lonDeg;
+      const cols = Math.max(2, Math.floor(extentM / cellSizeM));
+      const rows = cols;
+      const cellLatSize = metersToDegrees(CENTER.lat, cellSizeM).latDeg;
+      const cellLonSize = metersToDegrees(CENTER.lat, cellSizeM).lonDeg;
+
+      const points = [];
+      const cells = [];
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const centerLat = lat0 + (r + 0.5) * cellLatSize;
+          const centerLon = lon0 + (c + 0.5) * cellLonSize;
+          points.push([centerLon, centerLat]);
+          cells.push({ r, c, centerLon, centerLat });
+        }
+      }
+
+      status.textContent = 'sampling ' + points.length + ' points...';
+      try {
+        const res = await fetch('/api/elevation', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ points }) });
+        const json = await res.json();
+        const elevs = json.elevations || [];
+        // create entities for each cell
+        // clear previous
+        for (const s of floodState.cells) { if (s.entity) viewer.entities.remove(s.entity); }
+        floodState.cells = [];
+
+        for (let i = 0; i < cells.length; i++) {
+          const cell = cells[i];
+          const elev = elevs[i] != null ? elevs[i] : 0;
+          // rectangle corners
+          const halfLat = cellLatSize / 2.0;
+          const halfLon = cellLonSize / 2.0;
+          const west = cell.centerLon - halfLon;
+          const east = cell.centerLon + halfLon;
+          const south = cell.centerLat - halfLat;
+          const north = cell.centerLat + halfLat;
+          const entity = viewer.entities.add({
+            polygon: {
+              hierarchy: Cesium.Cartesian3.fromDegreesArray([west, south, east, south, east, north, west, north]),
+              material: Cesium.Color.BLUE.withAlpha(0.25),
+              height: elev,
+              extrudedHeight: elev,
+              outline: false
+            }
+          });
+          // store cell bounds for spatial tests later
+          floodState.cells.push({ entity, elev, west, east, south, north });
+        }
+
+        floodState.waterLevel = Math.min(...floodState.cells.map(s => s.elev));
+        // draw region bounding box entity so user sees the selected area
+        try {
+          const halfLat = cellLatSize * rows / 2.0;
+          const halfLon = cellLonSize * cols / 2.0;
+          const south = lat0;
+          const north = lat0 + rows * cellLatSize;
+          const west = lon0;
+          const east = lon0 + cols * cellLonSize;
+          // remove existing
+          if (floodState.regionBox && floodState.regionBox.entity) viewer.entities.remove(floodState.regionBox.entity);
+          const rectEnt = viewer.entities.add({
+            rectangle: {
+              coordinates: Cesium.Rectangle.fromDegrees(west, south, east, north),
+              material: Cesium.Color.BLUE.withAlpha(0.08),
+              outline: true,
+              outlineColor: Cesium.Color.BLUE
+            }
+          });
+          floodState.regionBox = { entity: rectEnt, west, south, east, north };
+        } catch (e) { console.warn('failed to draw region box', e); }
+        // After building region box, fetch only roads for this bbox and persist them
+        try {
+          fetchRoadsForBoxAndSave(west, south, east, north);
+        } catch (e) { console.warn('failed to fetch/save roads for bbox', e); }
+            const minE = Math.min(...floodState.cells.map(s => s.elev));
+            const maxE = Math.max(...floodState.cells.map(s => s.elev));
+            // enable and configure slider
+            try {
+              const slider = document.getElementById('waterSlider');
+              const val = document.getElementById('waterValue');
+              if (slider && val) {
+                slider.disabled = false;
+                slider.min = (minE - 5).toFixed(2);
+                slider.max = (maxE + 20).toFixed(2);
+                slider.step = 0.1;
+                slider.value = minE.toFixed(2);
+                val.textContent = slider.value;
+              }
+            } catch (e) {}
+            status.textContent = 'grid built. elevation range: ' + minE.toFixed(2) + ' — ' + maxE.toFixed(2);
+      } catch (e) {
+        console.error('elevation sampling failed', e);
+        status.textContent = 'sampling failed: ' + (e && e.message);
+      }
+    }
+
+    function updateFloodVisuals(waterLevel) {
+      for (const s of floodState.cells) {
+        const base = s.elev || 0;
+        const extrude = Math.max(base, waterLevel);
+        try { s.entity.polygon.extrudedHeight = extrude; s.entity.polygon.height = base; } catch (e) {}
+      }
+      // After updating cell extrusion, also update road colors to reflect flooded cells
+      try { updateRoadColorsByFlood(); } catch (e) {}
+    }
+
+    function startFloodAnimation() {
+      if (floodState.playing) return;
+      if (!floodState.cells.length) { document.getElementById('floodStatus').textContent = 'no grid — build first'; return; }
+      floodState.playing = true;
+      const minE = Math.min(...floodState.cells.map(s => s.elev));
+      const maxE = Math.max(...floodState.cells.map(s => s.elev));
+      const target = maxE + 10; // rise a bit above highest
+      let level = minE - 1;
+      const speed = 0.5; // meters per frame approx
+      function step() {
+        level += speed;
+        floodState.waterLevel = level;
+        updateFloodVisuals(level);
+        document.getElementById('floodStatus').textContent = 'water level: ' + level.toFixed(2) + ' m';
+        if (level < target && floodState.playing) floodState.animId = requestAnimationFrame(step);
+        else { floodState.playing = false; document.getElementById('floodStatus').textContent += ' — done'; }
+      }
+      floodState.animId = requestAnimationFrame(step);
+    }
+
+    function resetFlood() {
+      floodState.playing = false;
+      if (floodState.animId) cancelAnimationFrame(floodState.animId);
+      floodState.animId = null;
+      for (const s of floodState.cells) {
+        try { s.entity.polygon.extrudedHeight = s.elev; s.entity.polygon.height = s.elev; } catch (e) {}
+      }
+      document.getElementById('floodStatus').textContent = 'reset';
+      // reset slider
+      try {
+        const slider = document.getElementById('waterSlider');
+        const val = document.getElementById('waterValue');
+        if (slider && val) { slider.disabled = true; slider.value = 0; val.textContent = '0.0'; }
+      } catch (e) {}
+      try { updateRoadColorsByFlood(); } catch (e) {}
+    }
+
+    // wire UI
+    document.getElementById('buildGrid').addEventListener('click', function() {
+      const cellSizeM = Number(document.getElementById('cellSize').value) || 20;
+      const extentM = Number(document.getElementById('extentSize').value) || 400;
+      buildGridAndSample(cellSizeM, extentM);
+    });
+    document.getElementById('startFlood').addEventListener('click', startFloodAnimation);
+    document.getElementById('resetFlood').addEventListener('click', resetFlood);
+
+    // set center handler (update CENTER and fly camera)
+    try {
+      const setBtn = document.getElementById('setCenter');
+      if (setBtn) {
+        setBtn.addEventListener('click', function() {
+          const lon = parseFloat(document.getElementById('centerLon').value);
+          const lat = parseFloat(document.getElementById('centerLat').value);
+          if (Number.isNaN(lon) || Number.isNaN(lat)) { alert('Invalid coordinates'); return; }
+          CENTER.lon = lon; CENTER.lat = lat;
+          try { viewer.camera.flyTo({ destination: Cesium.Cartesian3.fromDegrees(CENTER.lon, CENTER.lat, CENTER.height), duration: 1.0 }); } catch (e) {}
+          document.getElementById('floodStatus').textContent = 'center set: ' + lon.toFixed(5) + ', ' + lat.toFixed(5);
+        });
+      }
+    } catch (e) { console.warn('Failed to wire setCenter button', e); }
+
+    // wire water slider for manual control
+    try {
+      const slider = document.getElementById('waterSlider');
+      const val = document.getElementById('waterValue');
+      if (slider && val) {
+        slider.addEventListener('input', function() {
+          const level = Number(slider.value);
+          val.textContent = level.toFixed(2);
+          floodState.waterLevel = level;
+          updateFloodVisuals(level);
+          document.getElementById('floodStatus').textContent = 'manual water level: ' + level.toFixed(2) + ' m';
+        });
+      }
+    } catch (e) { console.warn('Failed to wire water slider', e); }
+
+    // Update road colors based on flooded cells
+    function updateRoadColorsByFlood() {
+      if (!floodState || !floodState.cells || floodState.cells.length === 0) return;
+      const waterLevel = floodState.waterLevel;
+      // build list of flooded cell bounds
+      const flooded = [];
+      if (waterLevel != null) {
+        for (const c of floodState.cells) {
+          if (waterLevel > (c.elev || 0)) flooded.push(c);
+        }
+      }
+
+      for (const [id, ent] of roadEntities) {
+        try {
+          const coords = (ent.properties && ent.properties.origCoords) ? ent.properties.origCoords : null;
+          // Prefer per-road avg elevation when available
+          const roadElev = (ent.properties && (ent.properties.avg_elevation != null)) ? Number(ent.properties.avg_elevation) : null;
+          let isFlooded = false;
+          if (coords && flooded.length) {
+            for (const pt of coords) {
+              const lon = pt[0], lat = pt[1];
+              for (const c of flooded) {
+                if (lon >= c.west && lon <= c.east && lat >= c.south && lat <= c.north) {
+                  if (roadElev != null) {
+                    if (waterLevel > roadElev) { isFlooded = true; }
+                  } else {
+                    // fallback: if the cell elevation is below water level, mark flooded
+                    if ((c.elev || 0) < waterLevel) { isFlooded = true; }
+                  }
+                  break;
+                }
+              }
+              if (isFlooded) break;
+            }
+          }
+          if (isFlooded) {
+            const red = Cesium.Color.RED.withAlpha(0.95);
+            ent.polyline.material = new Cesium.PolylineGlowMaterialProperty({ color: red });
+          } else {
+            const risk = (ent.properties && typeof ent.properties.flood_risk === 'number') ? ent.properties.flood_risk : 0.0;
+            const color = riskToColor(risk);
+            ent.polyline.material = new Cesium.PolylineGlowMaterialProperty({ color: color.withAlpha(0.95) });
+          }
+        } catch (e) { /* ignore entity update errors */ }
+      }
+    }
+
+    // END
+  </script>
+
+  <script>
+    // Fetch roads in the current CENTER + extent and draw them
+    (function() {
+      const btn = document.getElementById('fetchRegionRoads');
+      const statusEl = document.getElementById('floodStatus');
+      const regionRoads = new Map();
+
+      async function fetchRegion() {
+        const extentM = Number(document.getElementById('extentSize').value) || 400;
+        const half = extentM / 2.0;
+        const degsHalf = metersToDegrees(CENTER.lat, half);
+        const south = CENTER.lat - degsHalf.latDeg;
+        const north = CENTER.lat + degsHalf.latDeg;
+        const west = CENTER.lon - degsHalf.lonDeg;
+        const east = CENTER.lon + degsHalf.lonDeg;
+        statusEl.textContent = 'Fetching roads from backend...';
+        try {
+          // Use roads_risk to retrieve only roads in bbox (with risk metadata) and geometry from roads_bbox
+          const geomRes = await fetch('/api/roads_bbox', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bbox: [west, south, east, north] }) });
+          if (!geomRes.ok) throw new Error('roads_bbox HTTP ' + geomRes.status);
+          const geojson = await geomRes.json();
+
+          const bboxStr = [west, south, east, north].join(',');
+          const riskRes = await fetch('/api/roads_risk?bbox=' + encodeURIComponent(bboxStr), { cache: 'no-store' });
+          let riskMap = new Map();
+          let riskArray = [];
+          if (riskRes.ok) {
+            const rj = await riskRes.json();
+            if (rj && rj.roads) {
+              if (Array.isArray(rj.roads)) {
+                riskArray = rj.roads;
+                for (const r of rj.roads) { if (r && r.id != null) riskMap.set(String(r.id), r); }
+              } else {
+                for (const key in rj.roads) { const r = rj.roads[key]; const rid = (r && r.id != null) ? String(r.id) : String(key); riskMap.set(rid, r); riskArray.push(r); }
+              }
+            }
+          }
+
+          // clear previous region roads
+          for (const r of regionRoads.values()) { viewer.entities.remove(r); }
+          regionRoads.clear();
+          let count = 0;
+          for (const feat of geojson.features || []) {
+            if (!feat.geometry || feat.geometry.type !== 'LineString') continue;
+            const coords = feat.geometry.coordinates;
+            const id = String(feat.id || (feat.properties && feat.properties.id) || JSON.stringify(coords).slice(0,40));
+            if (!riskMap.has(id)) continue;
+            const r = riskMap.get(id);
+            const positions = coords.map(c => Cesium.Cartesian3.fromDegrees(c[0], c[1], 8));
+            const mat = riskToColor(Number(r.risk) || 0.0);
+            const ent = viewer.entities.add({ id: 'region-'+id, polyline: { positions, width: 4.0, material: new Cesium.PolylineGlowMaterialProperty({ color: mat.withAlpha(0.95) }) } });
+            regionRoads.set(id, ent);
+            count++;
+          }
+          statusEl.textContent = 'Fetched ' + count + ' roads';
+
+          // persist filtered risk array
+          try { await fetch('/api/save_roads_risk', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ roads: riskArray }) }); } catch (e) { console.warn('save failed', e); }
+        } catch (e) {
+          console.error('Failed to fetch region roads', e);
+          statusEl.textContent = 'Failed to fetch roads: ' + (e && e.message);
+        }
+      }
+
+      if (btn) btn.addEventListener('click', fetchRegion);
+    })();
+  </script>
+
+  <!-- Terrain control script removed: terrain now auto-resets to Ellipsoid on load -->
+</body>
+</html>
