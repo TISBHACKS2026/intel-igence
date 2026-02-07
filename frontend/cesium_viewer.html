@@ -16,12 +16,17 @@
   <!-- terrainControls removed: auto-reset to Ellipsoid now enabled -->
   <div id="floodControls" style="position:fixed;right:8px;top:8px;z-index:999;background:rgba(255,255,255,0.9);padding:8px;border-radius:4px;font-family: sans-serif;">
     <div style="font-weight:600;margin-bottom:6px">Flood sim (Indiranagar)</div>
-    <div style="margin-bottom:6px">Center: lon <input id="centerLon" value="77.6406" style="width:90px"/> lat <input id="centerLat" value="12.9719" style="width:90px"/> <button id="setCenter">Set Center</button></div>
+    <div style="margin-bottom:6px">Center: <button id="setCenter">Set Center to Camera</button> <button id="pickCenter">Pick Center on map</button></div>
+    <div style="margin-bottom:6px"> 
+      <div style="font-weight:600;margin-bottom:4px">Location Picker</div>
+      <div style="font-size:13px;margin-bottom:4px">Origin: <button id="pickOrigin">Pick Origin on map</button></div>
+      <div style="font-size:13px">Destination: <button id="pickDest">Pick Destination on map</button></div>
+    </div>
     <div style="margin-bottom:6px">Cell size (m): <input id="cellSize" value="20" style="width:60px"/></div>
     <div style="margin-bottom:6px">Extent (m): <input id="extentSize" value="400" style="width:80px"/> (square)</div>
     <div style="margin-bottom:6px"><button id="buildGrid">Build Grid & Sample Elevation</button> <button id="fetchRegionRoads">Fetch Roads In Region</button></div>
     <div style="margin-bottom:6px"><button id="startFlood">Start Flood</button> <button id="resetFlood">Reset</button></div>
-    <div style="margin-bottom:6px">Water level (m): <input id="waterSlider" type="range" min="0" max="10" step="0.1" value="0" style="width:160px;vertical-align:middle;" disabled/> <span id="waterValue">0.0</span></div>
+    <div style="margin-bottom:6px">Rain (mm/hr): <input id="waterSlider" type="range" min="0" max="50" step="0.1" value="0" style="width:160px;vertical-align:middle;" disabled/> <span id="waterValue">0.0</span></div>
     <div id="floodStatus" style="font-size:12px;color:#222;margin-top:6px">idle</div>
   </div>
 
@@ -39,6 +44,47 @@
       ROADS_API_URL = window.location.origin + '/api/roads_flood_risk';
     } else {
       ROADS_API_URL = 'http://localhost:5001/api/roads_flood_risk';
+    }
+
+    // Smoothly animate an entity's polyline color from its current color to `targetColor`.
+    // `delay` (ms) is an optional stagger before the animation starts.
+    function setEntityColorSmooth(ent, targetColor, delay = 0, duration = 600) {
+      try {
+        // store animation state on the entity to avoid conflicting anims
+        if (!ent._colorAnim) ent._colorAnim = { raf: null };
+        if (ent._colorAnim.raf) { try { cancelAnimationFrame(ent._colorAnim.raf); } catch (e) {} }
+
+        // try to read current color; if unavailable, pick a default from riskToColor(0)
+        let start = [0.0, 0.8, 0.2, 0.95];
+        try {
+          const curMat = ent.polyline && ent.polyline.material && ent.polyline.material.color ? ent.polyline.material.color.getValue() : null;
+          if (curMat && typeof curMat.red === 'number') start = [curMat.red, curMat.green, curMat.blue, curMat.alpha || 0.95];
+        } catch (e) {}
+
+        const end = [targetColor.red, targetColor.green, targetColor.blue, targetColor.alpha];
+        const dur = duration;
+        const t0 = Date.now() + Math.max(0, delay);
+
+        function step() {
+          const now = Date.now();
+          const dt = Math.min(1, (now - t0) / dur);
+          // smoothstep
+          const s = dt * dt * (3 - 2 * dt);
+          const r = start[0] + (end[0] - start[0]) * s;
+          const g = start[1] + (end[1] - start[1]) * s;
+          const b = start[2] + (end[2] - start[2]) * s;
+          const a = start[3] + (end[3] - start[3]) * s;
+          try {
+            ent.polyline.material = new Cesium.PolylineGlowMaterialProperty({ color: new Cesium.Color(r, g, b, a) });
+          } catch (e) {}
+          if (dt < 1 && ent._colorAnim) {
+            ent._colorAnim.raf = requestAnimationFrame(step);
+          } else if (ent._colorAnim) {
+            ent._colorAnim.raf = null;
+          }
+        }
+        ent._colorAnim.raf = requestAnimationFrame(step);
+      } catch (e) { /* ignore */ }
     }
 
     // Basic token sanity check — don't rely on exact placeholder string comparisons.
@@ -295,29 +341,28 @@
     addRain();
 
     // --- Overlay roads as polylines and color based on flood risk ---
-    // Map flood risk (0..1) to a smoother gradient: green -> orange -> red
+    // Map flood risk (0..1) to a smooth gradient: green -> orange -> red
+    // Use eased interpolation so mid-range (orange) is more visible and
+    // color changes are gradual. We compress the scale slightly so
+    // low->mid transitions are more visible.
     function riskToColor(r) {
       r = Math.max(0, Math.min(1, r));
-      // define RGB endpoints
-      const greenColor = { r: 0.0, g: 0.8, b: 0.2 };
-      const orangeColor = { r: 1.0, g: 0.6, b: 0.0 };
-      const redColor = { r: 1.0, g: 0.0, b: 0.0 };
+      // ease the value to emphasize mid-range (use gamma < 1 to push values up)
+      const t = Math.pow(r, 0.7);
+      // endpoints
+      const green = [0.0, 0.8, 0.2];
+      const orange = [1.0, 0.6, 0.0];
+      const red = [1.0, 0.0, 0.0];
 
-      let rr, gg, bb;
-      if (r <= 0.5) {
-        // interpolate green -> orange for r in [0,0.5]
-        const t = r / 0.5;
-        rr = greenColor.r + (orangeColor.r - greenColor.r) * t;
-        gg = greenColor.g + (orangeColor.g - greenColor.g) * t;
-        bb = greenColor.b + (orangeColor.b - greenColor.b) * t;
-      } else {
-        // interpolate orange -> red for r in (0.5,1]
-        const t = (r - 0.5) / 0.5;
-        rr = orangeColor.r + (redColor.r - orangeColor.r) * t;
-        gg = orangeColor.g + (redColor.g - orangeColor.g) * t;
-        bb = orangeColor.b + (redColor.b - orangeColor.b) * t;
-      }
-      return new Cesium.Color(rr, gg, bb, 0.9);
+      let from, to, localT;
+      if (t <= 0.5) { from = green; to = orange; localT = t / 0.5; }
+      else { from = orange; to = red; localT = (t - 0.5) / 0.5; }
+      // smoothstep for smoother visual transition
+      localT = localT * localT * (3 - 2 * localT);
+      const rr = from[0] + (to[0] - from[0]) * localT;
+      const gg = from[1] + (to[1] - from[1]) * localT;
+      const bb = from[2] + (to[2] - from[2]) * localT;
+      return new Cesium.Color(rr, gg, bb, 0.95);
     }
 
     // Maintain a map of feature id -> entity
@@ -341,7 +386,9 @@
 
         // Fetch risk mappings filtered to this bbox (backend returns dict when bbox provided)
         const bboxStr = [west, south, east, north].join(',');
-        const riskRes = await fetch('/api/roads_risk?bbox=' + encodeURIComponent(bboxStr), { cache: 'no-store' });
+        // include current rain value if set so periodic updater doesn't overwrite manual slider
+        const currentRain = (typeof floodState.rain_mm === 'number') ? floodState.rain_mm : 0.0;
+        const riskRes = await fetch('/api/roads_risk?bbox=' + encodeURIComponent(bboxStr) + '&rain_mm=' + encodeURIComponent(currentRain), { cache: 'no-store' });
         let riskMap = new Map();
         if (riskRes.ok) {
           const rj = await riskRes.json();
@@ -441,7 +488,8 @@
         const geomJson = await geomRes.json();
 
         const bboxStr = [west, south, east, north].join(',');
-        const riskRes = await fetch('/api/roads_risk?bbox=' + encodeURIComponent(bboxStr), { cache: 'no-store' });
+        const currentRain = (typeof floodState.rain_mm === 'number') ? floodState.rain_mm : 0.0;
+        const riskRes = await fetch('/api/roads_risk?bbox=' + encodeURIComponent(bboxStr) + '&rain_mm=' + encodeURIComponent(currentRain), { cache: 'no-store' });
         let riskMap = new Map();
         let riskArray = [];
         if (riskRes.ok) {
@@ -499,14 +547,120 @@
     fetchAndUpdateRoads();
     setInterval(fetchAndUpdateRoads, 5000); // poll every 5s
 
-    // Simple helper to show sampling on click
+    // Location / feature click handler — supports pick-mode for origin/destination
+    let _pickMode = null; // 'origin' | 'dest' | null
+    let _originEntity = null, _destEntity = null;
+
+    function _createOrUpdateMarker(which, lon, lat) {
+      try {
+        const id = (which === 'origin') ? 'marker-origin' : 'marker-dest';
+        const existing = viewer.entities.getById(id);
+        const pos = Cesium.Cartesian3.fromDegrees(lon, lat, 8);
+        const color = (which === 'origin') ? Cesium.Color.CYAN : Cesium.Color.MAGENTA;
+        if (existing) {
+          existing.position = pos;
+          existing.label.text = (which === 'origin') ? 'Origin' : 'Destination';
+        } else {
+          viewer.entities.add({ id: id, position: pos, point: { pixelSize: 14, color: color, outlineColor: Cesium.Color.WHITE, outlineWidth: 2 }, label: { text: (which === 'origin') ? 'Origin' : 'Destination', font: '14px sans-serif', fillColor: Cesium.Color.WHITE, style: Cesium.LabelStyle.FILL_AND_OUTLINE, outlineColor: Cesium.Color.BLACK, outlineWidth: 2, pixelOffset: new Cesium.Cartesian2(0, -18) } });
+        }
+      } catch (e) { console.warn('marker create failed', e); }
+    }
+
+    function setOriginFromCoords(lon, lat) {
+      const oLon = document.getElementById('originLon');
+      const oLat = document.getElementById('originLat');
+      if (oLon) oLon.value = lon.toFixed(5);
+      if (oLat) oLat.value = lat.toFixed(5);
+      _createOrUpdateMarker('origin', lon, lat);
+      try { viewer.camera.flyTo({ destination: Cesium.Cartesian3.fromDegrees(lon, lat, 800), duration: 0.8 }); } catch (e) {}
+    }
+
+    function setDestinationFromCoords(lon, lat) {
+      const dLon = document.getElementById('destLon');
+      const dLat = document.getElementById('destLat');
+      if (dLon) dLon.value = lon.toFixed(5);
+      if (dLat) dLat.value = lat.toFixed(5);
+      _createOrUpdateMarker('dest', lon, lat);
+      try { viewer.camera.flyTo({ destination: Cesium.Cartesian3.fromDegrees(lon, lat, 800), duration: 0.8 }); } catch (e) {}
+    }
+
     viewer.screenSpaceEventHandler.setInputAction(function(click) {
+      // If we're in pick mode, set origin/destination from clicked position on globe
+      if (_pickMode) {
+        try {
+          const cart = viewer.camera.pickEllipsoid(click.position, viewer.scene.globe.ellipsoid);
+          if (!cart) { document.getElementById('floodStatus').textContent = 'Click on globe surface to pick a point'; return; }
+          const carto = Cesium.Cartographic.fromCartesian(cart);
+          const lon = Cesium.Math.toDegrees(carto.longitude);
+          const lat = Cesium.Math.toDegrees(carto.latitude);
+          if (_pickMode === 'origin') setOriginFromCoords(lon, lat);
+          else if (_pickMode === 'dest') setDestinationFromCoords(lon, lat);
+          else if (_pickMode === 'center') {
+            CENTER.lon = lon; CENTER.lat = lat;
+            try { viewer.camera.flyTo({ destination: Cesium.Cartesian3.fromDegrees(CENTER.lon, CENTER.lat, CENTER.height), duration: 1.0 }); } catch (e) {}
+            document.getElementById('floodStatus').textContent = 'center set: ' + lon.toFixed(5) + ', ' + lat.toFixed(5);
+          }
+          _pickMode = null;
+          document.getElementById('floodStatus').textContent = 'Picked ' + (carto && carto.height ? 'point' : '') + ' — pick mode cleared';
+        } catch (e) { console.warn('pick failed', e); }
+        return;
+      }
+
+      // default behavior: show road info when clicking on polylines/entities
       const picked = viewer.scene.pick(click.position);
       if (Cesium.defined(picked) && Cesium.defined(picked.id) && picked.id.properties) {
         const p = picked.id.properties;
         alert('Road ID: ' + picked.id.id + '\nFlood risk: ' + (p.flood_risk || 0));
       }
     }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+    // Draggable marker support: allow dragging origin/destination markers
+    let _dragging = { active: false, id: null };
+    viewer.screenSpaceEventHandler.setInputAction(function(click) {
+      // LEFT_DOWN: start drag if clicked marker
+      try {
+        const picked = viewer.scene.pick(click.position);
+        if (Cesium.defined(picked) && Cesium.defined(picked.id) && (picked.id.id === 'marker-origin' || picked.id.id === 'marker-dest')) {
+          _dragging.active = true;
+          _dragging.id = picked.id.id;
+          // consume interaction
+          document.getElementById('floodStatus').textContent = 'Dragging ' + (_dragging.id === 'marker-origin' ? 'origin' : 'destination');
+        }
+      } catch (e) { console.warn('drag start failed', e); }
+    }, Cesium.ScreenSpaceEventType.LEFT_DOWN);
+
+    viewer.screenSpaceEventHandler.setInputAction(function(movement) {
+      // MOUSE_MOVE: if dragging, update marker position to current mouse location on globe
+      if (!_dragging.active) return;
+      try {
+        const cart = viewer.camera.pickEllipsoid(movement.endPosition, viewer.scene.globe.ellipsoid);
+        if (!cart) return;
+        const carto = Cesium.Cartographic.fromCartesian(cart);
+        const lon = Cesium.Math.toDegrees(carto.longitude);
+        const lat = Cesium.Math.toDegrees(carto.latitude);
+        if (_dragging.id === 'marker-origin') {
+          _createOrUpdateMarker('origin', lon, lat);
+          const oLon = document.getElementById('originLon');
+          const oLat = document.getElementById('originLat');
+          if (oLon) oLon.value = lon.toFixed(5);
+          if (oLat) oLat.value = lat.toFixed(5);
+        } else if (_dragging.id === 'marker-dest') {
+          _createOrUpdateMarker('dest', lon, lat);
+          const dLon = document.getElementById('destLon');
+          const dLat = document.getElementById('destLat');
+          if (dLon) dLon.value = lon.toFixed(5);
+          if (dLat) dLat.value = lat.toFixed(5);
+        }
+      } catch (e) { console.warn('drag move failed', e); }
+    }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+
+    viewer.screenSpaceEventHandler.setInputAction(function() {
+      // LEFT_UP: stop dragging
+      if (_dragging.active) {
+        document.getElementById('floodStatus').textContent = 'Drag complete';
+      }
+      _dragging.active = false; _dragging.id = null;
+    }, Cesium.ScreenSpaceEventType.LEFT_UP);
 
     // Helpful console message
     console.log('Cesium viewer initialized. Center:', CENTER);
@@ -610,12 +764,13 @@
               const slider = document.getElementById('waterSlider');
               const val = document.getElementById('waterValue');
               if (slider && val) {
+                // slider now controls rainfall (mm/hr)
                 slider.disabled = false;
-                slider.min = (minE - 5).toFixed(2);
-                slider.max = (maxE + 20).toFixed(2);
+                slider.min = 0;
+                slider.max = 50;
                 slider.step = 0.1;
-                slider.value = minE.toFixed(2);
-                val.textContent = slider.value;
+                slider.value = 0;
+                val.textContent = '0.0';
               }
             } catch (e) {}
             status.textContent = 'grid built. elevation range: ' + minE.toFixed(2) + ' — ' + maxE.toFixed(2);
@@ -663,6 +818,8 @@
         try { s.entity.polygon.extrudedHeight = s.elev; s.entity.polygon.height = s.elev; } catch (e) {}
       }
       document.getElementById('floodStatus').textContent = 'reset';
+      // clear manual water level so updateRoadColorsByFlood treats as no water
+      try { floodState.waterLevel = null; } catch (e) {}
       // reset slider
       try {
         const slider = document.getElementById('waterSlider');
@@ -686,15 +843,42 @@
       const setBtn = document.getElementById('setCenter');
       if (setBtn) {
         setBtn.addEventListener('click', function() {
-          const lon = parseFloat(document.getElementById('centerLon').value);
-          const lat = parseFloat(document.getElementById('centerLat').value);
-          if (Number.isNaN(lon) || Number.isNaN(lat)) { alert('Invalid coordinates'); return; }
-          CENTER.lon = lon; CENTER.lat = lat;
-          try { viewer.camera.flyTo({ destination: Cesium.Cartesian3.fromDegrees(CENTER.lon, CENTER.lat, CENTER.height), duration: 1.0 }); } catch (e) {}
-          document.getElementById('floodStatus').textContent = 'center set: ' + lon.toFixed(5) + ', ' + lat.toFixed(5);
+          try {
+            const carto = Cesium.Cartographic.fromCartesian(viewer.camera.position);
+            const lon = Cesium.Math.toDegrees(carto.longitude);
+            const lat = Cesium.Math.toDegrees(carto.latitude);
+            if (Number.isNaN(lon) || Number.isNaN(lat)) { document.getElementById('floodStatus').textContent = 'Unable to determine camera center'; return; }
+            CENTER.lon = lon; CENTER.lat = lat;
+            try { viewer.camera.flyTo({ destination: Cesium.Cartesian3.fromDegrees(CENTER.lon, CENTER.lat, CENTER.height), duration: 1.0 }); } catch (e) {}
+            document.getElementById('floodStatus').textContent = 'center set: ' + lon.toFixed(5) + ', ' + lat.toFixed(5);
+          } catch (e) { console.warn('set center failed', e); }
         });
       }
     } catch (e) { console.warn('Failed to wire setCenter button', e); }
+
+    // wire origin/destination buttons
+    try {
+      const pickCenterBtn = document.getElementById('pickCenter');
+      const setOriginBtn = document.getElementById('setOrigin');
+      const pickOriginBtn = document.getElementById('pickOrigin');
+      const setDestBtn = document.getElementById('setDest');
+      const pickDestBtn = document.getElementById('pickDest');
+      if (setOriginBtn) setOriginBtn.addEventListener('click', function() {
+        const lon = parseFloat(document.getElementById('originLon').value);
+        const lat = parseFloat(document.getElementById('originLat').value);
+        if (Number.isNaN(lon) || Number.isNaN(lat)) { alert('Invalid origin coordinates'); return; }
+        setOriginFromCoords(lon, lat);
+      });
+      if (setDestBtn) setDestBtn.addEventListener('click', function() {
+        const lon = parseFloat(document.getElementById('destLon').value);
+        const lat = parseFloat(document.getElementById('destLat').value);
+        if (Number.isNaN(lon) || Number.isNaN(lat)) { alert('Invalid destination coordinates'); return; }
+        setDestinationFromCoords(lon, lat);
+      });
+      if (pickCenterBtn) pickCenterBtn.addEventListener('click', function() { _pickMode = 'center'; document.getElementById('floodStatus').textContent = 'Pick center: click on the map'; });
+      if (pickOriginBtn) pickOriginBtn.addEventListener('click', function() { _pickMode = 'origin'; document.getElementById('floodStatus').textContent = 'Pick origin: click on the map'; });
+      if (pickDestBtn) pickDestBtn.addEventListener('click', function() { _pickMode = 'dest'; document.getElementById('floodStatus').textContent = 'Pick destination: click on the map'; });
+    } catch (e) { console.warn('Failed to wire origin/destination buttons', e); }
 
     // wire water slider for manual control
     try {
@@ -702,11 +886,23 @@
       const val = document.getElementById('waterValue');
       if (slider && val) {
         slider.addEventListener('input', function() {
+          // Stop any running animation when the user takes manual control
+          if (floodState.playing) {
+            floodState.playing = false;
+            if (floodState.animId) {
+              try { cancelAnimationFrame(floodState.animId); } catch (e) {}
+              floodState.animId = null;
+            }
+            document.getElementById('floodStatus').textContent = 'manual control (animation stopped)';
+          }
+
           const level = Number(slider.value);
           val.textContent = level.toFixed(2);
-          floodState.waterLevel = level;
-          updateFloodVisuals(level);
-          document.getElementById('floodStatus').textContent = 'manual water level: ' + level.toFixed(2) + ' m';
+          // store rain (mm/hr) separately from waterLevel used for flood extrusion
+          floodState.rain_mm = level;
+          document.getElementById('floodStatus').textContent = 'manual rain: ' + level.toFixed(2) + ' mm/hr';
+          // Debounced update: send rain (mm/hr) to backend and refresh risks
+          try { scheduleRiskUpdateFromRain(level); } catch (e) { console.warn('risk update schedule failed', e); }
         });
       }
     } catch (e) { console.warn('Failed to wire water slider', e); }
@@ -746,16 +942,53 @@
               if (isFlooded) break;
             }
           }
-          if (isFlooded) {
-            const red = Cesium.Color.RED.withAlpha(0.95);
-            ent.polyline.material = new Cesium.PolylineGlowMaterialProperty({ color: red });
-          } else {
-            const risk = (ent.properties && typeof ent.properties.flood_risk === 'number') ? ent.properties.flood_risk : 0.0;
-            const color = riskToColor(risk);
-            ent.polyline.material = new Cesium.PolylineGlowMaterialProperty({ color: color.withAlpha(0.95) });
-          }
+          try {
+            // Stagger color changes slightly per-entity so not everything flips at once.
+            // Use a deterministic small delay based on id so updates look organic.
+            const seed = (function(s) {
+              let h = 0; for (let i=0;i<s.length;i++) h = ((h<<5)-h)+s.charCodeAt(i); return Math.abs(h);
+            })(String(id));
+            const delay = seed % 250; // 0..249 ms stagger
+            const duration = 600; // longer interpolation for smoother change
+            if (isFlooded) {
+              const red = Cesium.Color.RED.withAlpha(0.95);
+              setEntityColorSmooth(ent, red, delay, duration);
+            } else {
+              const risk = (ent.properties && typeof ent.properties.flood_risk === 'number') ? ent.properties.flood_risk : 0.0;
+              const color = riskToColor(risk);
+              setEntityColorSmooth(ent, color, delay, duration);
+            }
+          } catch (e) { /* ignore update errors */ }
         } catch (e) { /* ignore entity update errors */ }
       }
+    }
+
+    // --- Risk update helpers: fetch recomputed risks from backend using rain (mm/hr) ---
+    let _riskUpdateTimer = null;
+    function scheduleRiskUpdateFromRain(rain_mm) {
+      if (_riskUpdateTimer) clearTimeout(_riskUpdateTimer);
+      _riskUpdateTimer = setTimeout(() => { updateRisksFromRain(rain_mm); _riskUpdateTimer = null; }, 250);
+    }
+
+    async function updateRisksFromRain(rain_mm) {
+      try {
+        const url = '/api/roads_risk?rain_mm=' + encodeURIComponent(rain_mm);
+        const res = await fetch(url, { cache: 'no-store' });
+        if (!res.ok) { console.warn('roads_risk fetch failed', res.status); return; }
+        const j = await res.json();
+        const arr = j && j.roads ? (Array.isArray(j.roads) ? j.roads : Object.values(j.roads)) : [];
+        // Update in-memory entities' flood_risk properties
+        for (const r of arr) {
+          const rid = String(r && (r.id != null ? r.id : r && r['id']));
+          if (!rid) continue;
+          if (roadEntities.has(rid)) {
+            const ent = roadEntities.get(rid);
+            try { ent.properties = ent.properties || {}; ent.properties.flood_risk = Number(r.risk) || 0.0; ent.properties.avg_elevation = r.avg_elevation != null ? Number(r.avg_elevation) : ent.properties.avg_elevation; } catch (e) {}
+          }
+        }
+        // refresh colors after applying new risks
+        try { updateRoadColorsByFlood(); } catch (e) {}
+      } catch (e) { console.warn('updateRisksFromRain error', e); }
     }
 
     // END
