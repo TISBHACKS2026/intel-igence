@@ -4,6 +4,8 @@ import os
 import sys
 import traceback
 import requests
+import json
+import importlib
 
 # Ensure project root is on sys.path so modules at repo root (like roadrisk.py)
 # can be imported when the server is started from the backend/ directory.
@@ -363,6 +365,58 @@ def roadrisk_source():
             txt = fh.read()
         resp = make_response(txt)
         resp.headers['Content-Type'] = 'text/plain; charset=utf-8'
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        return resp
+    except Exception as e:
+        traceback.print_exc()
+        resp = make_response(jsonify({'error': 'internal server error', 'detail': str(e)}), 500)
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        return resp
+
+
+@app.route('/api/route_networkx', methods=['POST'])
+def route_networkx():
+    """Compute least-risk route using person3.route_networkx utilities.
+
+    Expects JSON: { "bbox": [west,south,east,north], "origin": [lon,lat], "dest": [lon,lat], "penalty": 5.0 }
+    Returns: { "path": [[lon,lat],...], "total_weight": float }
+    """
+    try:
+        data = request.get_json(force=True)
+        if not data:
+            return make_response(jsonify({'error': 'expected JSON body'}), 400)
+        bbox = data.get('bbox')
+        origin = data.get('origin')
+        dest = data.get('dest')
+        penalty = float(data.get('penalty', 5.0))
+        if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
+            return make_response(jsonify({'error': 'bbox required as [west,south,east,north]'}), 400)
+        if not (isinstance(origin, (list, tuple)) and len(origin) == 2 and isinstance(dest, (list, tuple)) and len(dest) == 2):
+            return make_response(jsonify({'error': 'origin and dest required as [lon,lat]'}), 400)
+
+        # Import the router module and build graph. Pass server base URL so module can call /api endpoints if needed
+        try:
+            router = importlib.import_module('person3.route_networkx')
+        except Exception as e:
+            traceback.print_exc()
+            return make_response(jsonify({'error': 'failed to import router module', 'detail': str(e)}), 500)
+
+        base_url = request.host_url.rstrip('/')
+        west, south, east, north = map(float, bbox)
+        G = router.build_graph_from_bbox(west, south, east, north, backend_url=base_url, risk_penalty=penalty)
+        o_k, od = router.nearest_node_key(G, float(origin[0]), float(origin[1]))
+        d_k, dd = router.nearest_node_key(G, float(dest[0]), float(dest[1]))
+        if o_k is None or d_k is None:
+            return make_response(jsonify({'error': 'no nearby graph nodes', 'origin_nearest_dist_m': od, 'dest_nearest_dist_m': dd}), 400)
+        try:
+            path_nodes = __import__('networkx').dijkstra_path(G, source=o_k, target=d_k, weight='weight')
+        except Exception as e:
+            traceback.print_exc()
+            return make_response(jsonify({'error': 'no path found', 'detail': str(e)}), 400)
+
+        coords = [[G.nodes[n]['lon'], G.nodes[n]['lat']] for n in path_nodes]
+        total_weight = sum(G[path_nodes[i]][path_nodes[i+1]]['weight'] for i in range(len(path_nodes)-1)) if len(path_nodes) > 1 else 0.0
+        resp = make_response(jsonify({'path': coords, 'total_weight': total_weight, 'nodes': len(path_nodes)}))
         resp.headers['Access-Control-Allow-Origin'] = '*'
         return resp
     except Exception as e:

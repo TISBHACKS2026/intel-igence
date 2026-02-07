@@ -27,6 +27,7 @@
     <div style="margin-bottom:6px"><button id="buildGrid">Build Grid & Sample Elevation</button> <button id="fetchRegionRoads">Fetch Roads In Region</button></div>
     <div style="margin-bottom:6px"><button id="startFlood">Start Flood</button> <button id="resetFlood">Reset</button></div>
     <div style="margin-bottom:6px">Rain (mm/hr): <input id="waterSlider" type="range" min="0" max="50" step="0.1" value="0" style="width:160px;vertical-align:middle;" disabled/> <span id="waterValue">0.0</span></div>
+    <div style="margin-top:6px"><button id="computeRoute">Compute Least-Risk Route</button> <button id="clearRoute">Clear Route</button> <button id="autoDemoRoute">Auto Demo Route</button></div>
     <div id="floodStatus" style="font-size:12px;color:#222;margin-top:6px">idle</div>
   </div>
 
@@ -880,6 +881,60 @@
       if (pickDestBtn) pickDestBtn.addEventListener('click', function() { _pickMode = 'dest'; document.getElementById('floodStatus').textContent = 'Pick destination: click on the map'; });
     } catch (e) { console.warn('Failed to wire origin/destination buttons', e); }
 
+    // wire compute/clear route buttons
+    try {
+      const computeBtn = document.getElementById('computeRoute');
+      const clearBtn = document.getElementById('clearRoute');
+    const autoBtn = document.getElementById('autoDemoRoute');
+      if (computeBtn) computeBtn.addEventListener('click', async function() {
+        // require both origin and dest markers
+        const origEnt = viewer.entities.getById('marker-origin');
+        const destEnt = viewer.entities.getById('marker-dest');
+        if (!origEnt || !destEnt) { document.getElementById('floodStatus').textContent = 'Place both origin and destination markers first'; return; }
+        try {
+          const opos = origEnt.position.getValue(Cesium.JulianDate.now());
+          const dpos = destEnt.position.getValue(Cesium.JulianDate.now());
+          const oCarto = Cesium.Cartographic.fromCartesian(opos);
+          const dCarto = Cesium.Cartographic.fromCartesian(dpos);
+          const olon = Cesium.Math.toDegrees(oCarto.longitude), olat = Cesium.Math.toDegrees(oCarto.latitude);
+          const dlon = Cesium.Math.toDegrees(dCarto.longitude), dlat = Cesium.Math.toDegrees(dCarto.latitude);
+          document.getElementById('floodStatus').textContent = 'Computing least-risk route...';
+
+          // Compute route; allow computeLeastRiskRoute to build/fetch a temp graph
+          document.getElementById('floodStatus').textContent = 'Computing least-risk route...';
+          const path = await computeLeastRiskRoute(olon, olat, dlon, dlat);
+          if (path && path.length) {
+            _drawRoute(path);
+            document.getElementById('floodStatus').textContent = 'Route drawn (' + path.length + ' nodes) — graph nodes: ' + nodesCount + ', origin≈' + distO + 'm dest≈' + distD + 'm';
+          } else {
+            document.getElementById('floodStatus').textContent = 'No route found — graph nodes: ' + nodesCount + ', origin≈' + distO + 'm dest≈' + distD + 'm';
+          }
+        } catch (e) { console.warn('compute route failed', e); document.getElementById('floodStatus').textContent = 'Route compute error: ' + (e && e.message); }
+      });
+      if (clearBtn) clearBtn.addEventListener('click', function() { _clearRoute(); document.getElementById('floodStatus').textContent = 'Route cleared'; });
+      if (autoBtn) autoBtn.addEventListener('click', async function() {
+        // choose a sensible demo bbox / origin/dest near the current center
+        try {
+          document.getElementById('floodStatus').textContent = 'Running auto demo route...';
+          const deg = m => m / 111320.0;
+          const half = 200;
+          const south = CENTER.lat - deg(half);
+          const north = CENTER.lat + deg(half);
+          const west = CENTER.lon - deg(half);
+          const east = CENTER.lon + deg(half);
+          // small offset origins within bbox
+          const origin = [CENTER.lon - deg(20), CENTER.lat];
+          const dest = [CENTER.lon + deg(20), CENTER.lat];
+          const res = await fetch('/api/route_networkx', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bbox: [west, south, east, north], origin: origin, dest: dest, penalty: 5.0 }) });
+          if (!res.ok) { document.getElementById('floodStatus').textContent = 'Auto demo failed: server error'; return; }
+          const j = await res.json();
+          if (!j || !Array.isArray(j.path) || !j.path.length) { document.getElementById('floodStatus').textContent = 'Auto demo: no path returned'; return; }
+          _drawRoute(j.path);
+          document.getElementById('floodStatus').textContent = 'Auto demo route drawn (' + j.path.length + ' nodes)';
+        } catch (e) { console.warn('auto demo failed', e); document.getElementById('floodStatus').textContent = 'Auto demo error'; }
+      });
+    } catch (e) { console.warn('Failed to wire route buttons', e); }
+
     // wire water slider for manual control
     try {
       const slider = document.getElementById('waterSlider');
@@ -990,6 +1045,171 @@
         try { updateRoadColorsByFlood(); } catch (e) {}
       } catch (e) { console.warn('updateRisksFromRain error', e); }
     }
+
+    // --- Least-risk routing (client-side) ---
+    // Build a graph from `roadEntities`. Nodes are distinct coordinate points
+    // (rounded). Edges are consecutive polyline segments weighted by length*(1+risk*5).
+    function _buildGraphFromRoads() {
+      const nodes = new Map();
+      function keyFor(lon, lat) { return lon.toFixed(5) + ',' + lat.toFixed(5); }
+
+      for (const [id, ent] of roadEntities) {
+        try {
+          const coords = (ent.properties && ent.properties.origCoords) ? ent.properties.origCoords : null;
+          const risk = (ent.properties && typeof ent.properties.flood_risk === 'number') ? Number(ent.properties.flood_risk) : 0.0;
+          if (!coords || coords.length < 2) continue;
+          for (let i = 0; i < coords.length - 1; i++) {
+            const a = coords[i]; const b = coords[i+1];
+            const ka = keyFor(a[0], a[1]); const kb = keyFor(b[0], b[1]);
+            if (!nodes.has(ka)) nodes.set(ka, { coord: [a[0], a[1]], edges: [] });
+            if (!nodes.has(kb)) nodes.set(kb, { coord: [b[0], b[1]], edges: [] });
+            // compute length in meters using Cesium distance
+            const pA = Cesium.Cartesian3.fromDegrees(a[0], a[1], 0);
+            const pB = Cesium.Cartesian3.fromDegrees(b[0], b[1], 0);
+            const len = Cesium.Cartesian3.distance(pA, pB) || 1.0;
+            const weight = len * (1.0 + risk * 5.0);
+            nodes.get(ka).edges.push({ to: kb, weight: weight, coord: [b[0], b[1]] });
+            nodes.get(kb).edges.push({ to: ka, weight: weight, coord: [a[0], a[1]] });
+          }
+        } catch (e) { /* skip bad */ }
+      }
+      return nodes;
+    }
+
+    function _findNearestNode(nodes, lon, lat) {
+      let best = null; let bestDist = Infinity;
+      const p = Cesium.Cartesian3.fromDegrees(lon, lat, 0);
+      for (const [k, v] of nodes) {
+        const c = v.coord; const pc = Cesium.Cartesian3.fromDegrees(c[0], c[1], 0);
+        const d = Cesium.Cartesian3.distance(p, pc);
+        if (d < bestDist) { bestDist = d; best = k; }
+      }
+      return { key: best, dist: bestDist };
+    }
+
+    async function computeLeastRiskRoute(originLon, originLat, destLon, destLat) {
+      // Try server-side NetworkX route first (fast when available)
+      try {
+        const extentM = Number(document.getElementById('extentSize') ? document.getElementById('extentSize').value : 400) || 400;
+        const half = extentM / 2.0;
+        const deg = m => m / 111320.0;
+        const south = CENTER.lat - deg(half);
+        const north = CENTER.lat + deg(half);
+        const west = CENTER.lon - deg(half);
+        const east = CENTER.lon + deg(half);
+        const body = { bbox: [west, south, east, north], origin: [originLon, originLat], dest: [destLon, destLat], penalty: 5.0 };
+        const res = await fetch('/api/route_networkx', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        if (res.ok) {
+          const j = await res.json();
+          if (j && Array.isArray(j.path) && j.path.length) {
+            return j.path;
+          }
+        }
+      } catch (e) {
+        console.warn('server-side route failed, falling back to client routing', e);
+      }
+
+      let nodes = _buildGraphFromRoads();
+      // If no client-side roadEntities are loaded, fetch geometry+risks for a bbox
+      // around the current center/extent and build a temporary graph so routing still works.
+      if (!nodes || nodes.size === 0) {
+        try {
+          const extentM = Number(document.getElementById('extentSize') ? document.getElementById('extentSize').value : 400) || 400;
+          const half = extentM / 2.0;
+          const deg = m => m / 111320.0;
+          const south = CENTER.lat - deg(half);
+          const north = CENTER.lat + deg(half);
+          const west = CENTER.lon - deg(half);
+          const east = CENTER.lon + deg(half);
+          document.getElementById('floodStatus').textContent = 'Loading roads for routing (this may take a moment)...';
+          const geomRes = await fetch('/api/roads_bbox', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bbox: [west, south, east, north] }) });
+          if (!geomRes.ok) { document.getElementById('floodStatus').textContent = 'Failed to load road geometry'; return null; }
+          const geomJson = await geomRes.json();
+          const rainArg = encodeURIComponent((typeof floodState.rain_mm === 'number') ? floodState.rain_mm : 0.0);
+          const riskRes = await fetch('/api/roads_risk?bbox=' + encodeURIComponent([west, south, east, north].join(',')) + '&rain_mm=' + rainArg, { cache: 'no-store' });
+          let riskMap = new Map();
+          if (riskRes.ok) {
+            const rj = await riskRes.json();
+            if (rj && rj.roads) {
+              if (Array.isArray(rj.roads)) {
+                for (const r of rj.roads) if (r && r.id != null) riskMap.set(String(r.id), r);
+              } else {
+                for (const key in rj.roads) { const r = rj.roads[key]; const rid = (r && r.id != null) ? String(r.id) : String(key); riskMap.set(rid, r); }
+              }
+            }
+          }
+          // Build nodes from fetched geometry + riskMap
+          const temp = new Map();
+          function keyFor(lon, lat) { return lon.toFixed(5) + ',' + lat.toFixed(5); }
+          for (const feat of (geomJson.features || [])) {
+            try {
+              if (!feat.geometry || feat.geometry.type !== 'LineString') continue;
+              const coords = feat.geometry.coordinates;
+              const id = String(feat.id || (feat.properties && feat.properties.id) || JSON.stringify(coords).slice(0,40));
+              const r = riskMap.has(id) ? riskMap.get(id) : (feat.properties && feat.properties.flood_risk != null ? { risk: Number(feat.properties.flood_risk) } : { risk: 0.0 });
+              const riskVal = (r && r.risk != null) ? Number(r.risk) : 0.0;
+              for (let i = 0; i < coords.length - 1; i++) {
+                const a = coords[i], b = coords[i+1];
+                const ka = keyFor(a[0], a[1]); const kb = keyFor(b[0], b[1]);
+                if (!temp.has(ka)) temp.set(ka, { coord: [a[0], a[1]], edges: [] });
+                if (!temp.has(kb)) temp.set(kb, { coord: [b[0], b[1]], edges: [] });
+                const pA = Cesium.Cartesian3.fromDegrees(a[0], a[1], 0);
+                const pB = Cesium.Cartesian3.fromDegrees(b[0], b[1], 0);
+                const len = Cesium.Cartesian3.distance(pA, pB) || 1.0;
+                const weight = len * (1.0 + riskVal * 5.0);
+                temp.get(ka).edges.push({ to: kb, weight: weight, coord: [b[0], b[1]] });
+                temp.get(kb).edges.push({ to: ka, weight: weight, coord: [a[0], a[1]] });
+              }
+            } catch (e) { /* ignore */ }
+          }
+          nodes = temp;
+        } catch (e) {
+          console.warn('failed to fetch/build temp road graph', e);
+          document.getElementById('floodStatus').textContent = 'Failed to build temporary road graph';
+          return null;
+        }
+      }
+      const o = _findNearestNode(nodes, originLon, originLat);
+      const d = _findNearestNode(nodes, destLon, destLat);
+      if (!o.key || !d.key) { document.getElementById('floodStatus').textContent = 'Could not find nearby road nodes'; return null; }
+
+      // Dijkstra
+      const dist = new Map(); const prev = new Map();
+      for (const k of nodes.keys()) { dist.set(k, Infinity); prev.set(k, null); }
+      dist.set(o.key, 0);
+      const Q = new Set(nodes.keys());
+      while (Q.size) {
+        // find minimal dist in Q
+        let u = null; let uDist = Infinity;
+        for (const k of Q) { const dv = dist.get(k); if (dv < uDist) { uDist = dv; u = k; } }
+        if (u === null) break;
+        Q.delete(u);
+        if (u === d.key) break;
+        const node = nodes.get(u);
+        if (!node) continue;
+        for (const e of node.edges) {
+          if (!Q.has(e.to)) continue;
+          const alt = uDist + e.weight;
+          if (alt < dist.get(e.to)) { dist.set(e.to, alt); prev.set(e.to, u); }
+        }
+      }
+
+      if (!prev.get(d.key) && o.key !== d.key) { document.getElementById('floodStatus').textContent = 'No path found'; return null; }
+      const path = [];
+      let cur = d.key; while (cur) { const n = nodes.get(cur); if (n) path.push(n.coord); cur = prev.get(cur); }
+      path.reverse();
+      return path;
+    }
+
+    function _drawRoute(pathCoords) {
+      // remove existing
+      try { const existing = viewer.entities.getById('least-risk-route'); if (existing) viewer.entities.remove(existing); } catch (e) {}
+      if (!pathCoords || pathCoords.length === 0) return;
+      const positions = pathCoords.map(p => Cesium.Cartesian3.fromDegrees(p[0], p[1], 8));
+      viewer.entities.add({ id: 'least-risk-route', polyline: { positions: positions, width: 8.0, material: new Cesium.PolylineGlowMaterialProperty({ color: Cesium.Color.CYAN, glowPower: 0.25 }), clampToGround: false } });
+    }
+
+    function _clearRoute() { try { const e = viewer.entities.getById('least-risk-route'); if (e) viewer.entities.remove(e); } catch (e) {} }
 
     // END
   </script>
